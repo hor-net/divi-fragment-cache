@@ -121,7 +121,7 @@ final class DFC_Cache {
 		if ( null !== $styles_before ) {
 			$styles_after = $this->get_styles_snapshot();
 			if ( is_array( $styles_after ) ) {
-				$css = $this->styles_delta_to_css( $styles_before, $styles_after );
+				$css = $this->build_cached_css( (string) $output, $styles_before, $styles_after );
 			}
 		}
 
@@ -600,6 +600,108 @@ final class DFC_Cache {
 		return ltrim( $out );
 	}
 
+	private function build_cached_css( string $html, array $styles_before, array $styles_after ): string {
+		$order_classes = $this->extract_order_classes_from_html( $html );
+		$by_class_css  = '';
+
+		if ( ! empty( $order_classes ) ) {
+			$by_class_css = $this->styles_for_order_classes_to_css( $styles_after, $order_classes );
+		}
+
+		$delta_css = $this->styles_delta_to_css( $styles_before, $styles_after );
+
+		if ( '' === $by_class_css ) {
+			return $delta_css;
+		}
+
+		if ( '' === $delta_css ) {
+			return $by_class_css;
+		}
+
+		return $by_class_css . "\n\n" . $delta_css;
+	}
+
+	private function extract_order_classes_from_html( string $html ): array {
+		if ( '' === $html ) {
+			return [];
+		}
+
+		$matches = [];
+		if ( ! preg_match_all( '/\bet_pb_[a-z0-9_]+_[0-9]+[a-z0-9_-]*\b/i', $html, $matches ) ) {
+			return [];
+		}
+
+		$classes = [];
+		foreach ( $matches[0] as $class_name ) {
+			$class_name = strtolower( trim( (string) $class_name ) );
+			if ( '' === $class_name ) {
+				continue;
+			}
+			$classes[] = $class_name;
+		}
+
+		return array_values( array_unique( $classes ) );
+	}
+
+	private function selector_targets_order_class( string $selector, array $order_classes ): bool {
+		if ( '' === $selector || empty( $order_classes ) ) {
+			return false;
+		}
+
+		$selector_lc = strtolower( $selector );
+
+		foreach ( $order_classes as $class_name ) {
+			if ( '' === $class_name ) {
+				continue;
+			}
+
+			if ( false !== strpos( $selector_lc, '.' . $class_name ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private function styles_for_order_classes_to_css( array $styles, array $order_classes ): string {
+		if ( empty( $styles ) || empty( $order_classes ) ) {
+			return '';
+		}
+
+		$out = '';
+		foreach ( $styles as $media_query => $rules ) {
+			if ( ! is_array( $rules ) || empty( $rules ) ) {
+				continue;
+			}
+
+			$chunk = '';
+			foreach ( $rules as $selector => $settings ) {
+				if ( ! is_string( $selector ) || ! is_array( $settings ) || empty( $settings['declaration'] ) ) {
+					continue;
+				}
+
+				if ( ! $this->selector_targets_order_class( $selector, $order_classes ) ) {
+					continue;
+				}
+
+				$chunk .= "\n{$selector} { {$settings['declaration']} }";
+			}
+
+			if ( '' === $chunk ) {
+				continue;
+			}
+
+			if ( 'general' === $media_query ) {
+				$out .= $chunk;
+				continue;
+			}
+
+			$out .= "\n\n{$media_query} {\n{$chunk}\n}";
+		}
+
+		return ltrim( $out );
+	}
+
 	private function wrap_css( string $css ): string {
 		$css = trim( $css );
 		if ( '' === $css ) {
@@ -637,4 +739,3 @@ final class DFC_Cache {
 		return $ttl > 0 ? $ttl : 3600;
 	}
 }
-
