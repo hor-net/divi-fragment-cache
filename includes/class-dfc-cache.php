@@ -18,6 +18,8 @@ final class DFC_Cache {
 	private array $tag_counters = [];
 	private array $pending_post_keys = [];
 	private bool $request_bypass = false;
+	private bool $should_call_divi_reinit = false;
+	private array $pending_animation_data = [];
 	private int $debug_hits = 0;
 	private int $debug_misses = 0;
 	private int $debug_purges = 0;
@@ -31,6 +33,7 @@ final class DFC_Cache {
 		add_filter( 'do_shortcode_tag', [ $this, 'maybe_store_cached_shortcode' ], 120, 4 );
 		add_action( 'wp', [ $this, 'handle_query_params' ], 0 );
 		add_action( 'send_headers', [ $this, 'send_debug_headers' ], 999 );
+		add_action( 'wp_footer', [ $this, 'maybe_print_animation_reinit_script' ], 999 );
 		add_action( 'shutdown', [ $this, 'flush_pending_post_keys' ], 0 );
 		add_action( 'save_post', [ $this, 'on_save_post' ], 20, 1 );
 		add_action( 'delete_post', [ $this, 'on_delete_post' ], 20, 1 );
@@ -59,13 +62,32 @@ final class DFC_Cache {
 				'ttl'           => $this->ttl_for( $tag, $attrs, $m ),
 				'counts'        => $this->extract_shortcode_counts( $m ),
 				'styles_before' => $this->get_styles_snapshot(),
+				'anim_before'   => $this->get_animation_data_snapshot(),
+			];
+			return $override;
+		}
+
+		$payload = is_array( $hit ) ? $hit : [ 'html' => (string) $hit ];
+
+		$html = (string) ( $payload['html'] ?? '' );
+		if ( '' === trim( $html ) ) {
+			wp_cache_delete( $key, self::CACHE_GROUP );
+			delete_transient( $key );
+			$this->debug_misses++;
+			$this->miss_stack[] = [
+				'tag'           => $tag,
+				'key'           => $key,
+				'post_id'       => $this->get_current_post_id(),
+				'ttl'           => $this->ttl_for( $tag, $attrs, $m ),
+				'counts'        => $this->extract_shortcode_counts( $m ),
+				'styles_before' => $this->get_styles_snapshot(),
+				'anim_before'   => $this->get_animation_data_snapshot(),
 			];
 			return $override;
 		}
 
 		$this->debug_hits++;
 
-		$payload = is_array( $hit ) ? $hit : [ 'html' => (string) $hit ];
 		$this->served_stack[] = [
 			'tag'     => $tag,
 			'key'     => $key,
@@ -76,8 +98,25 @@ final class DFC_Cache {
 			$this->fast_forward_occurrence_counters( $tag, $payload['counts'] );
 		}
 
-		$output = (string) ( $payload['html'] ?? '' );
-		$output = apply_filters( 'do_shortcode_tag', $output, $tag, $attrs, $m );
+		if ( $this->output_has_divi_animation_markers( $html ) ) {
+			$this->should_call_divi_reinit = true;
+		}
+
+		if ( isset( $payload['anim'] ) && is_array( $payload['anim'] ) && ! empty( $payload['anim'] ) ) {
+			foreach ( $payload['anim'] as $entry ) {
+				if ( ! is_array( $entry ) ) {
+					continue;
+				}
+				$class = isset( $entry['class'] ) ? (string) $entry['class'] : '';
+				if ( '' === $class ) {
+					continue;
+				}
+				$this->pending_animation_data[ $class ] = $entry;
+			}
+			$this->should_call_divi_reinit = true;
+		}
+
+		$output = apply_filters( 'do_shortcode_tag', $html, $tag, $attrs, $m );
 
 		return $output;
 	}
@@ -106,6 +145,10 @@ final class DFC_Cache {
 			return $output;
 		}
 
+		if ( '' === trim( (string) $output ) ) {
+			return $output;
+		}
+
 		$miss = $this->pop_miss_if_match( $tag );
 		if ( null === $miss ) {
 			return $output;
@@ -125,11 +168,24 @@ final class DFC_Cache {
 			}
 		}
 
+		$anim_before = isset( $miss['anim_before'] ) && is_array( $miss['anim_before'] ) ? $miss['anim_before'] : null;
+		$anim        = [];
+		if ( null !== $anim_before ) {
+			$anim_after = $this->get_animation_data_snapshot();
+			if ( is_array( $anim_after ) ) {
+				$anim = $this->build_cached_animation_data( $anim_before, $anim_after );
+			}
+		}
+
 		$payload = [
 			'html'   => (string) $output,
 			'css'    => $css,
 			'counts' => isset( $miss['counts'] ) && is_array( $miss['counts'] ) ? $miss['counts'] : $this->extract_shortcode_counts( $m ),
 		];
+
+		if ( ! empty( $anim ) ) {
+			$payload['anim'] = $anim;
+		}
 
 		$this->cache_set( (string) $miss['key'], $payload, $ttl );
 		$this->add_cache_key_for_post( (int) ( $miss['post_id'] ?? 0 ), (string) $miss['key'] );
@@ -347,6 +403,79 @@ final class DFC_Cache {
 
 	private function is_divi_module_shortcode( string $tag ): bool {
 		return 0 === strpos( $tag, 'et_pb_' );
+	}
+
+	private function output_has_divi_animation_markers( string $output ): bool {
+		if ( '' === $output ) {
+			return false;
+		}
+
+		$out = strtolower( $output );
+
+		return false !== strpos( $out, 'et-waypoint' )
+			|| false !== strpos( $out, 'data-animation-style' )
+			|| false !== strpos( $out, 'et_pb_animation_' );
+	}
+
+	private function get_animation_data_snapshot(): ?array {
+		if ( ! function_exists( 'et_builder_handle_animation_data' ) ) {
+			return null;
+		}
+
+		$data = et_builder_handle_animation_data();
+		if ( ! is_array( $data ) ) {
+			return null;
+		}
+
+		return $data;
+	}
+
+	private function build_cached_animation_data( array $before, array $after ): array {
+		$before_classes = [];
+		foreach ( $before as $entry ) {
+			if ( ! is_array( $entry ) || empty( $entry['class'] ) ) {
+				continue;
+			}
+			$before_classes[ (string) $entry['class'] ] = true;
+		}
+
+		$delta = [];
+		foreach ( $after as $entry ) {
+			if ( ! is_array( $entry ) || empty( $entry['class'] ) ) {
+				continue;
+			}
+
+			$class = (string) $entry['class'];
+			if ( isset( $before_classes[ $class ] ) ) {
+				continue;
+			}
+
+			$delta[] = $entry;
+		}
+
+		return $delta;
+	}
+
+	public function maybe_print_animation_reinit_script(): void {
+		if ( ! $this->should_call_divi_reinit ) {
+			return;
+		}
+
+		if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return;
+		}
+
+		if ( $this->request_bypass || $this->is_bypass_requested() || $this->is_purge_requested() ) {
+			return;
+		}
+
+		$entries = array_values( $this->pending_animation_data );
+		$json    = wp_json_encode( $entries, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+		if ( ! is_string( $json ) ) {
+			$json = '[]';
+		}
+
+		echo '<script>(function(){try{var a=' . $json . ';if(!window.et_animation_data){window.et_animation_data=[]}if(a&&a.length){var e={};for(var i=0;i<window.et_animation_data.length;i++){var c=window.et_animation_data[i]&&window.et_animation_data[i]["class"];if(c){e[c]=true}}for(var j=0;j<a.length;j++){var it=a[j];var cls=it&&it["class"];if(!cls||e[cls]){continue}window.et_animation_data.push(it);e[cls]=true}}if(typeof window.et_process_animation_data==="function"){window.et_process_animation_data(true)}if(typeof window.et_reinit_waypoint_modules==="function"){window.et_reinit_waypoint_modules()}}catch(_){}})();</script>';
 	}
 
 	private function build_cache_key( string $tag, $attrs, $m, int $occurrence ): string {
