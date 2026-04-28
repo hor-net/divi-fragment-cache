@@ -10,6 +10,7 @@ final class DFC_Cache {
 	private const POST_META_KEY    = '_divi_fragment_cache_keys';
 	private const QUERY_BYPASS     = 'divi_fc_bypass';
 	private const QUERY_PURGE      = 'divi_fc_purge';
+	private const ACTION_PURGE_ALL = 'dfc_purge_all';
 
 	private DFC_Options $options;
 
@@ -34,6 +35,8 @@ final class DFC_Cache {
 		add_action( 'wp', [ $this, 'handle_query_params' ], 0 );
 		add_action( 'send_headers', [ $this, 'send_debug_headers' ], 999 );
 		add_action( 'wp_footer', [ $this, 'maybe_print_animation_reinit_script' ], 999 );
+		add_action( 'admin_bar_menu', [ $this, 'register_admin_bar_menu' ], 100 );
+		add_action( 'admin_post_' . self::ACTION_PURGE_ALL, [ $this, 'handle_purge_all_request' ] );
 		add_action( 'shutdown', [ $this, 'flush_pending_post_keys' ], 0 );
 		add_action( 'save_post', [ $this, 'on_save_post' ], 20, 1 );
 		add_action( 'delete_post', [ $this, 'on_delete_post' ], 20, 1 );
@@ -415,6 +418,126 @@ final class DFC_Cache {
 		return false !== strpos( $out, 'et-waypoint' )
 			|| false !== strpos( $out, 'data-animation-style' )
 			|| false !== strpos( $out, 'et_pb_animation_' );
+	}
+
+	public function register_admin_bar_menu( $admin_bar ): void {
+		if ( ! is_object( $admin_bar ) || ! is_callable( [ $admin_bar, 'add_node' ] ) ) {
+			return;
+		}
+
+		if ( ! is_user_logged_in() ) {
+			return;
+		}
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		if ( ! function_exists( 'is_admin_bar_showing' ) || ! is_admin_bar_showing() ) {
+			return;
+		}
+
+		$parent_id = 'dfc';
+
+		$admin_bar->add_node(
+			[
+				'id'    => $parent_id,
+				'title' => esc_html__( 'Divi FC', 'divi-fragment-cache' ),
+				'href'  => false,
+			]
+		);
+
+		$redirect = '';
+		if ( isset( $_SERVER['REQUEST_URI'] ) ) {
+			$redirect = (string) wp_unslash( $_SERVER['REQUEST_URI'] );
+		}
+
+		$url = add_query_arg(
+			[
+				'action'   => self::ACTION_PURGE_ALL,
+				'redirect' => $redirect,
+			],
+			admin_url( 'admin-post.php' )
+		);
+		$url = wp_nonce_url( $url, self::ACTION_PURGE_ALL );
+
+		$admin_bar->add_node(
+			[
+				'id'     => 'dfc_purge_all',
+				'parent' => $parent_id,
+				'title'  => esc_html__( 'Svuota tutta la cache', 'divi-fragment-cache' ),
+				'href'   => $url,
+			]
+		);
+	}
+
+	public function handle_purge_all_request(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'Accesso negato.', 'divi-fragment-cache' ), '', [ 'response' => 403 ] );
+		}
+
+		check_admin_referer( self::ACTION_PURGE_ALL );
+
+		$this->purge_all_cache();
+		$this->debug_purges++;
+
+		$redirect = '';
+		if ( isset( $_GET['redirect'] ) ) {
+			$redirect = rawurldecode( (string) wp_unslash( $_GET['redirect'] ) );
+		}
+
+		if ( '' !== $redirect ) {
+			wp_safe_redirect( $redirect );
+			exit;
+		}
+
+		wp_safe_redirect( admin_url() );
+		exit;
+	}
+
+	private function purge_all_cache(): void {
+		if ( function_exists( 'delete_post_meta_by_key' ) ) {
+			delete_post_meta_by_key( self::POST_META_KEY );
+		}
+
+		global $wpdb;
+		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) ) {
+			return;
+		}
+
+		$like_transient = $wpdb->esc_like( '_transient_' . self::TRANSIENT_PREFIX ) . '%';
+
+		$rows = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$like_transient
+			)
+		);
+
+		if ( is_array( $rows ) ) {
+			foreach ( $rows as $option_name ) {
+				$option_name = is_string( $option_name ) ? $option_name : '';
+				if ( '' === $option_name ) {
+					continue;
+				}
+
+				$transient_key = preg_replace( '/^_transient_/', '', $option_name );
+				$transient_key = is_string( $transient_key ) ? $transient_key : '';
+				if ( '' === $transient_key ) {
+					continue;
+				}
+
+				wp_cache_delete( $transient_key, self::CACHE_GROUP );
+			}
+		}
+
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+				$wpdb->esc_like( '_transient_' . self::TRANSIENT_PREFIX ) . '%',
+				$wpdb->esc_like( '_transient_timeout_' . self::TRANSIENT_PREFIX ) . '%'
+			)
+		);
 	}
 
 	private function get_animation_data_snapshot(): ?array {
