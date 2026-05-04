@@ -65,6 +65,7 @@ final class DFC_Cache {
 				'ttl'           => $this->ttl_for( $tag, $attrs, $m ),
 				'counts'        => $this->extract_shortcode_counts( $m ),
 				'styles_before' => $this->get_styles_snapshot(),
+				'free_form_before' => $this->get_free_form_styles_snapshot(),
 				'anim_before'   => $this->get_animation_data_snapshot(),
 			];
 			return $override;
@@ -84,6 +85,7 @@ final class DFC_Cache {
 				'ttl'           => $this->ttl_for( $tag, $attrs, $m ),
 				'counts'        => $this->extract_shortcode_counts( $m ),
 				'styles_before' => $this->get_styles_snapshot(),
+				'free_form_before' => $this->get_free_form_styles_snapshot(),
 				'anim_before'   => $this->get_animation_data_snapshot(),
 			];
 			return $override;
@@ -168,6 +170,17 @@ final class DFC_Cache {
 			$styles_after = $this->get_styles_snapshot();
 			if ( is_array( $styles_after ) ) {
 				$css = $this->build_cached_css( (string) $output, $styles_before, $styles_after );
+			}
+		}
+
+		$free_form_before = isset( $miss['free_form_before'] ) && is_string( $miss['free_form_before'] ) ? $miss['free_form_before'] : null;
+		if ( null !== $free_form_before ) {
+			$free_form_after = $this->get_free_form_styles_snapshot();
+			if ( is_string( $free_form_after ) ) {
+				$free_form_css = $this->build_cached_free_form_css( $free_form_before, $free_form_after );
+				if ( '' !== $free_form_css ) {
+					$css = '' === $css ? $free_form_css : ( $css . "\n\n" . $free_form_css );
+				}
 			}
 		}
 
@@ -795,6 +808,14 @@ final class DFC_Cache {
 		return (array) ET_Builder_Element::get_style_array( false );
 	}
 
+	private function get_free_form_styles_snapshot(): ?string {
+		if ( ! class_exists( 'ET_Builder_Element' ) || ! is_callable( [ 'ET_Builder_Element', 'get_free_form_styles' ] ) ) {
+			return null;
+		}
+
+		return (string) ET_Builder_Element::get_free_form_styles();
+	}
+
 	private function styles_delta_to_css( array $before, array $after ): string {
 		$delta = [];
 
@@ -871,6 +892,29 @@ final class DFC_Cache {
 		}
 
 		return $by_class_css . "\n\n" . $delta_css;
+	}
+
+	private function build_cached_free_form_css( string $before, string $after ): string {
+		if ( '' === $after || $before === $after ) {
+			return '';
+		}
+
+		if ( '' === $before ) {
+			return trim( $after );
+		}
+
+		$before_len = strlen( $before );
+		if ( 0 === strpos( $after, $before ) ) {
+			return trim( substr( $after, $before_len ) );
+		}
+
+		$pos = strpos( $after, $before );
+		if ( false !== $pos ) {
+			$delta = substr( $after, 0, $pos ) . substr( $after, $pos + $before_len );
+			return trim( $delta );
+		}
+
+		return '';
 	}
 
 	private function extract_order_classes_from_html( string $html ): array {
