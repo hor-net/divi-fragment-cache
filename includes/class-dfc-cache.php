@@ -1026,17 +1026,22 @@ try{
 			return;
 		}
 
-		$files = glob( $dir . '/*.html' );
-		if ( ! is_array( $files ) ) {
-			return;
-		}
-
-		foreach ( $files as $file ) {
-			$file = is_string( $file ) ? $file : '';
-			if ( '' === $file ) {
+		$patterns = [
+			$dir . '/*.html',
+			$dir . '/*.html.gz',
+		];
+		foreach ( $patterns as $pattern ) {
+			$files = glob( $pattern );
+			if ( ! is_array( $files ) ) {
 				continue;
 			}
-			@unlink( $file );
+			foreach ( $files as $file ) {
+				$file = is_string( $file ) ? $file : '';
+				if ( '' === $file ) {
+					continue;
+				}
+				@unlink( $file );
+			}
 		}
 	}
 
@@ -1368,6 +1373,21 @@ try{
 		@rename( $tmp, $path );
 		@chmod( $path, 0644 );
 		@touch( $path, $exp );
+
+		$gz = function_exists( 'gzencode' ) ? @gzencode( $html, 6 ) : false;
+		if ( is_string( $gz ) && '' !== $gz ) {
+			$gz_path = $path . '.gz';
+			$gz_tmp  = $gz_path . '.tmp';
+			$gz_ok   = false !== @file_put_contents( $gz_tmp, $gz, LOCK_EX );
+			if ( $gz_ok ) {
+				@rename( $gz_tmp, $gz_path );
+				@chmod( $gz_path, 0644 );
+				@touch( $gz_path, $exp );
+			} else {
+				@unlink( $gz_tmp );
+			}
+		}
+
 		return true;
 	}
 
@@ -1843,6 +1863,7 @@ try{
 		}
 
 		@unlink( $path );
+		@unlink( $path . '.gz' );
 	}
 
 	private function get_current_post_id(): int {
