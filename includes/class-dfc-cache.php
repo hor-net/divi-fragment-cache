@@ -37,6 +37,10 @@ final class DFC_Cache {
 	private int $page_debug_hits = 0;
 	private int $page_debug_misses = 0;
 	private string $page_store_status = '';
+	private bool $page_cache_nonce_limited = false;
+	private ?int $page_cache_nonce_refresh_at = null;
+	private ?int $page_cache_nonce_original_ttl = null;
+	private ?int $page_cache_nonce_effective_ttl = null;
 
 	public function __construct( DFC_Options $options ) {
 		$this->options = $options;
@@ -104,7 +108,7 @@ final class DFC_Cache {
 			return null;
 		}
 
-		$now = (int) current_time( 'timestamp' );
+		$now = (int) time();
 
 		$ids = [];
 		if ( class_exists( 'WP_Query' ) ) {
@@ -336,6 +340,11 @@ try{
 			return;
 		}
 
+		$this->page_cache_nonce_limited = false;
+		$this->page_cache_nonce_refresh_at = null;
+		$this->page_cache_nonce_original_ttl = null;
+		$this->page_cache_nonce_effective_ttl = null;
+
 		$key = $this->build_page_cache_key();
 		if ( '' === $key ) {
 			return;
@@ -351,6 +360,7 @@ try{
 		$hit  = $this->cache_get( $key );
 		$html = null;
 		$exp  = null;
+		$meta = [];
 		if ( is_string( $hit ) && '' !== $hit ) {
 			$html = $hit;
 			$timeout = get_option( '_transient_timeout_' . $key, 0 );
@@ -363,6 +373,16 @@ try{
 			if ( isset( $hit['exp'] ) ) {
 				$exp = is_numeric( $hit['exp'] ) ? (int) $hit['exp'] : null;
 			}
+			if ( isset( $hit['meta'] ) && is_array( $hit['meta'] ) ) {
+				$meta = $hit['meta'];
+			}
+		}
+
+		if ( ! empty( $meta ) && isset( $meta['nonce_limited'] ) && (int) $meta['nonce_limited'] === 1 ) {
+			$this->page_cache_nonce_limited = true;
+			$this->page_cache_nonce_refresh_at = isset( $meta['nonce_refresh_at'] ) && is_numeric( $meta['nonce_refresh_at'] ) ? (int) $meta['nonce_refresh_at'] : null;
+			$this->page_cache_nonce_original_ttl = isset( $meta['ttl_original'] ) && is_numeric( $meta['ttl_original'] ) ? (int) $meta['ttl_original'] : null;
+			$this->page_cache_nonce_effective_ttl = isset( $meta['ttl_effective'] ) && is_numeric( $meta['ttl_effective'] ) ? (int) $meta['ttl_effective'] : null;
 		}
 
 		if ( is_string( $html ) && '' !== $html ) {
@@ -373,13 +393,14 @@ try{
 				header( 'Content-Type: text/html; charset=' . get_bloginfo( 'charset' ) );
 				if ( $this->options->get_bool( 'debug_headers' ) ) {
 					header( 'X-Divi-FPC-WP: hit' );
+					$this->maybe_send_nonce_limit_header();
 				}
 			}
 
 			if ( null !== $exp ) {
-				$ttl = $exp - (int) current_time( 'timestamp' );
+				$ttl = $exp - (int) time();
 				if ( $ttl > 0 ) {
-					$this->write_full_page_cache_file( $key, $html, $ttl );
+					$this->write_full_page_cache_file( $key, $html, $ttl, $meta );
 				}
 			}
 
@@ -402,6 +423,10 @@ try{
 		$this->page_cache_ob_level = 0;
 		$this->page_cache_next_invalidate_at = null;
 		$this->page_cache_uncacheable = false;
+		$this->page_cache_nonce_limited = false;
+		$this->page_cache_nonce_refresh_at = null;
+		$this->page_cache_nonce_original_ttl = null;
+		$this->page_cache_nonce_effective_ttl = null;
 
 		ob_start( [ $this, 'page_cache_buffer_callback' ] );
 		$this->page_cache_ob_level = (int) ob_get_level();
@@ -420,6 +445,7 @@ try{
 		}
 
 		if ( ! headers_sent() && $this->options->get_bool( 'debug_headers' ) ) {
+			$this->maybe_send_nonce_limit_header();
 			$st = '' !== $this->page_store_status ? $this->page_store_status : 'n/a';
 			header( 'X-Divi-FPC-WP-Store: ' . $st );
 		}
@@ -1029,6 +1055,7 @@ try{
 		$patterns = [
 			$dir . '/*.html',
 			$dir . '/*.html.gz',
+			$dir . '/*.html.meta.json',
 		];
 		foreach ( $patterns as $pattern ) {
 			$files = glob( $pattern );
@@ -1210,6 +1237,94 @@ try{
 		return false;
 	}
 
+	private function page_html_might_contain_nonce( string $html ): bool {
+		if ( '' === $html ) {
+			return false;
+		}
+
+		if ( false !== strpos( $html, 'name="_wpnonce"' ) ) {
+			return true;
+		}
+		if ( false !== strpos( $html, "name='_wpnonce'" ) ) {
+			return true;
+		}
+		if ( false !== strpos( $html, 'name="_wp_http_referer"' ) ) {
+			return true;
+		}
+		if ( false !== strpos( $html, 'wpApiSettings.nonce' ) ) {
+			return true;
+		}
+		if ( false !== strpos( $html, '"wpApiSettings"' ) && false !== strpos( $html, '"nonce"' ) ) {
+			return true;
+		}
+		if ( false !== strpos( $html, 'edd_ajax_nonce' ) ) {
+			return true;
+		}
+
+		return false;
+	}
+
+	private function seconds_until_wp_nonce_should_refresh(): ?int {
+		if ( ! function_exists( 'wp_nonce_tick' ) ) {
+			return null;
+		}
+
+		$now = (int) time();
+
+		$nonce_life = (int) apply_filters( 'nonce_life', DAY_IN_SECONDS, -1 );
+		if ( $nonce_life < 60 ) {
+			$nonce_life = DAY_IN_SECONDS;
+		}
+
+		$half = (float) ( $nonce_life / 2 );
+		if ( $half <= 0 ) {
+			return null;
+		}
+
+		$tick = (int) ceil( $now / $half );
+		if ( $tick < 1 ) {
+			$tick = 1;
+		}
+
+		$refresh_at = (int) floor( ( $tick + 1 ) * $half );
+		$delta      = $refresh_at - $now;
+
+		return $delta > 0 ? $delta : 0;
+	}
+
+	private function maybe_send_nonce_limit_header(): void {
+		if ( ! $this->page_cache_nonce_limited ) {
+			return;
+		}
+		if ( headers_sent() ) {
+			return;
+		}
+		if ( ! $this->options->get_bool( 'debug_headers' ) ) {
+			return;
+		}
+
+		$refresh_in = null;
+		if ( null !== $this->page_cache_nonce_refresh_at ) {
+			$refresh_in = $this->page_cache_nonce_refresh_at - (int) time();
+			if ( $refresh_in < 0 ) {
+				$refresh_in = 0;
+			}
+		}
+
+		$value = 'limited';
+		if ( null !== $refresh_in ) {
+			$value .= ';refresh_in=' . (int) $refresh_in;
+		}
+		if ( null !== $this->page_cache_nonce_effective_ttl ) {
+			$value .= ';ttl=' . (int) $this->page_cache_nonce_effective_ttl;
+		}
+		if ( null !== $this->page_cache_nonce_original_ttl ) {
+			$value .= ';from=' . (int) $this->page_cache_nonce_original_ttl;
+		}
+
+		header( 'X-Divi-FPC-Nonce: ' . $value );
+	}
+
 	private function maybe_store_full_page_cache(): void {
 		if ( function_exists( 'edd_is_checkout' ) && edd_is_checkout() ) {
 			$this->page_store_status = 'skip-checkout';
@@ -1290,7 +1405,11 @@ try{
 			return;
 		}
 
-		$now = (int) current_time( 'timestamp' );
+		$now = (int) time();
+		$this->page_cache_nonce_limited = false;
+		$this->page_cache_nonce_refresh_at = null;
+		$this->page_cache_nonce_original_ttl = null;
+		$this->page_cache_nonce_effective_ttl = null;
 
 		if ( null !== $this->page_cache_next_invalidate_at ) {
 			$delta = $this->page_cache_next_invalidate_at - $now;
@@ -1307,22 +1426,44 @@ try{
 			}
 		}
 
+		if ( $this->page_html_might_contain_nonce( $html ) ) {
+			$ttl_before_nonce = $ttl;
+			$delta = $this->seconds_until_wp_nonce_should_refresh();
+			if ( null !== $delta && $delta > 0 && $delta < $ttl ) {
+				$this->page_cache_nonce_limited = true;
+				$this->page_cache_nonce_refresh_at = $now + $delta;
+				$this->page_cache_nonce_original_ttl = $ttl_before_nonce;
+				$this->page_cache_nonce_effective_ttl = $delta;
+				$ttl = $delta;
+			}
+		}
+
 		if ( $ttl < 1 ) {
 			$this->page_store_status = 'skip-ttl-window';
 			return;
 		}
 
 		$exp = $now + $ttl;
+		$meta = [];
+		if ( $this->page_cache_nonce_limited ) {
+			$meta = [
+				'nonce_limited'    => 1,
+				'nonce_refresh_at' => null !== $this->page_cache_nonce_refresh_at ? (int) $this->page_cache_nonce_refresh_at : 0,
+				'ttl_original'     => null !== $this->page_cache_nonce_original_ttl ? (int) $this->page_cache_nonce_original_ttl : 0,
+				'ttl_effective'    => null !== $this->page_cache_nonce_effective_ttl ? (int) $this->page_cache_nonce_effective_ttl : 0,
+			];
+		}
 		$this->cache_set(
 			$key,
 			[
 				'html' => $html,
 				'exp'  => $exp,
+				'meta' => $meta,
 			],
 			$ttl
 		);
 		$this->add_cache_key_for_post( $this->get_current_post_id(), $key );
-		$file_ok = $this->write_full_page_cache_file( $key, $html, $ttl );
+		$file_ok = $this->write_full_page_cache_file( $key, $html, $ttl, $meta );
 		$this->flush_pending_post_keys();
 		$this->page_store_status = 'stored;ttl=' . (int) $ttl . ';file=' . ( $file_ok ? '1' : '0' );
 	}
@@ -1340,7 +1481,7 @@ try{
 		return false !== strpos( $host, '.local' );
 	}
 
-	private function write_full_page_cache_file( string $key, string $html, int $ttl ): bool {
+	private function write_full_page_cache_file( string $key, string $html, int $ttl, array $meta = [] ): bool {
 		$path = $this->get_page_cache_file_path_from_key( $key );
 		if ( '' === $path ) {
 			$this->page_store_status = 'skip-write-path';
@@ -1359,7 +1500,7 @@ try{
 			return false;
 		}
 
-		$exp = (int) current_time( 'timestamp' ) + max( 1, $ttl );
+		$exp = (int) time() + max( 1, $ttl );
 		$out = $html;
 
 		$tmp = $path . '.tmp';
@@ -1385,6 +1526,30 @@ try{
 				@touch( $gz_path, $exp );
 			} else {
 				@unlink( $gz_tmp );
+			}
+		}
+
+		$meta_path = $path . '.meta.json';
+		$meta_tmp  = $meta_path . '.tmp';
+		$nonce_limited = isset( $meta['nonce_limited'] ) && (int) $meta['nonce_limited'] === 1;
+		if ( $nonce_limited ) {
+			$json = json_encode( $meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+			if ( is_string( $json ) && '' !== $json ) {
+				$meta_ok = false !== @file_put_contents( $meta_tmp, $json, LOCK_EX );
+				if ( $meta_ok ) {
+					@rename( $meta_tmp, $meta_path );
+					@chmod( $meta_path, 0644 );
+					@touch( $meta_path, $exp );
+				} else {
+					@unlink( $meta_tmp );
+				}
+			} else {
+				@unlink( $meta_tmp );
+			}
+		} else {
+			@unlink( $meta_tmp );
+			if ( is_file( $meta_path ) ) {
+				@unlink( $meta_path );
 			}
 		}
 
@@ -1428,7 +1593,7 @@ try{
 			return [ 'uncacheable' => false ];
 		}
 
-		$now      = (int) current_time( 'timestamp' );
+		$now      = (int) time();
 		$next_ts  = null;
 
 		foreach ( $data as $condition ) {
@@ -1864,6 +2029,7 @@ try{
 
 		@unlink( $path );
 		@unlink( $path . '.gz' );
+		@unlink( $path . '.meta.json' );
 	}
 
 	private function get_current_post_id(): int {
