@@ -1264,6 +1264,61 @@ try{
 		return false;
 	}
 
+	private function page_html_has_form_with_nonce( string $html ): bool {
+		if ( '' === $html ) {
+			return false;
+		}
+
+		if ( false === stripos( $html, '<form' ) ) {
+			return false;
+		}
+
+		if ( ! $this->page_html_might_contain_nonce( $html ) ) {
+			return false;
+		}
+
+		$form_patterns = [
+			'/<form[^>]*method=["\']post["\'][^>]*>/i',
+			'/<form[^>]*>/i',
+		];
+
+		foreach ( $form_patterns as $pattern ) {
+			if ( 1 === preg_match( $pattern, $html, $form_matches ) ) {
+				$form_tag = $form_matches[0];
+				$form_start_pos = stripos( $html, $form_tag );
+				if ( false === $form_start_pos ) {
+					continue;
+				}
+
+				$after_form = substr( $html, $form_start_pos );
+				$nonce_patterns = [
+					'name="_wpnonce"',
+					"name='_wpnonce'",
+					'_wpnonce',
+					'wpnonce',
+				];
+
+				foreach ( $nonce_patterns as $nonce ) {
+					if ( false !== strpos( $after_form, $nonce ) ) {
+						$action_pattern = '/action=["\']([^"\']*)["\']/i';
+						if ( 1 === preg_match( $action_pattern, $form_tag, $action_matches ) ) {
+							$action = $action_matches[1];
+							if ( '' !== $action && '#' !== $action ) {
+								return true;
+							}
+						}
+
+						if ( 1 === preg_match( '/method=["\']post["\']/i', $form_tag ) ) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+
+		return false;
+	}
+
 	private function seconds_until_wp_nonce_should_refresh(): ?int {
 		if ( ! function_exists( 'wp_nonce_tick' ) ) {
 			return null;
@@ -1345,6 +1400,12 @@ try{
 		$html = $this->page_cache_buffer;
 		if ( '' === trim( $html ) ) {
 			$this->page_store_status = 'skip-empty';
+			return;
+		}
+
+		if ( $this->page_html_has_form_with_nonce( $html ) ) {
+			$this->page_cache_uncacheable = true;
+			$this->page_store_status = 'skip-form-with-nonce';
 			return;
 		}
 
