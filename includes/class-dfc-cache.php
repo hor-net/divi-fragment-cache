@@ -1072,6 +1072,16 @@ try{
 		}
 	}
 
+	private function is_privacy_eraser_request(): bool {
+		if ( ! defined( 'DOING_AJAX' ) || ! DOING_AJAX ) {
+			return false;
+		}
+		if ( isset( $_POST['action'] ) && 'wp-privacy-erase-personal-data' === $_POST['action'] ) {
+			return true;
+		}
+		return false;
+	}
+
 	private function should_page_cache_current_request(): bool {
 		$ttl = $this->options->get_int( 'ttl' );
 		if ( $ttl < 1 ) {
@@ -1079,7 +1089,7 @@ try{
 			return false;
 		}
 
-		if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+		if ( is_admin() || wp_doing_ajax() || $this->is_privacy_eraser_request() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
 			$this->page_store_status = 'skip-context';
 			return false;
 		}
