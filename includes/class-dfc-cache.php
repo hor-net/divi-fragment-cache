@@ -472,6 +472,10 @@ try{
 
 		$this->page_cache_buffer .= $buffer;
 
+		if ( ! $this->page_cache_uncacheable && $this->contains_form( $buffer ) ) {
+			$this->page_cache_uncacheable = true;
+		}
+
 		return $buffer;
 	}
 
@@ -620,6 +624,10 @@ try{
 		}
 
 		if ( '' === trim( (string) $output ) ) {
+			return $output;
+		}
+
+		if ( $this->contains_form( (string) $output ) ) {
 			return $output;
 		}
 
@@ -1077,6 +1085,23 @@ try{
 			return false;
 		}
 		if ( isset( $_POST['action'] ) && 'wp-privacy-erase-personal-data' === $_POST['action'] ) {
+			return true;
+		}
+		return false;
+	}
+
+	private function contains_form( string $content ): bool {
+		$content = strtolower( $content );
+		if ( false !== strpos( $content, '<form' ) ) {
+			return true;
+		}
+		if ( false !== strpos( $content, 'wpforms' ) || false !== strpos( $content, 'gravityforms' ) ) {
+			return true;
+		}
+		if ( false !== strpos( $content, 'ninja-forms' ) || false !== strpos( $content, 'forminator' ) ) {
+			return true;
+		}
+		if ( false !== strpos( $content, 'edd-' ) && false !== strpos( $content, 'checkout' ) ) {
 			return true;
 		}
 		return false;
