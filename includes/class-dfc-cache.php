@@ -489,6 +489,13 @@ try{
 			return $override;
 		}
 
+		// Form submissions can render a success message in place of the form.
+		// Never cache the containing page, even when that response has no form HTML.
+		if ( $this->is_interactive_form_shortcode( $tag ) ) {
+			$this->page_cache_uncacheable = true;
+			return $override;
+		}
+
 		$attrs = is_array( $attrs ) ? $attrs : (array) $attrs;
 		if ( empty( $attrs['display_conditions'] ) ) {
 			return $override;
@@ -802,6 +809,12 @@ try{
 			return false;
 		}
 
+		// Form modules are stateful: after submission they may output only a
+		// success/error message. Caching either state would hide the live form.
+		if ( $this->is_interactive_form_shortcode( $tag ) ) {
+			return false;
+		}
+
 		$attrs = is_array( $attrs ) ? $attrs : (array) $attrs;
 
 		if ( $this->request_bypass || $this->is_bypass_requested() ) {
@@ -905,6 +918,17 @@ try{
 
 	private function is_divi_module_shortcode( string $tag ): bool {
 		return 0 === strpos( $tag, 'et_pb_' );
+	}
+
+	private function is_interactive_form_shortcode( string $tag ): bool {
+		return in_array(
+			strtolower( $tag ),
+			[
+				'et_pb_contact_form',
+				'et_pb_signup',
+			],
+			true
+		);
 	}
 
 	private function output_has_divi_animation_markers( string $output ): bool {
@@ -1184,7 +1208,7 @@ try{
 
 		$raw = wp_json_encode(
 			[
-				'v'       => 6,
+				'v'       => 7,
 				'ssl'     => function_exists( 'is_ssl' ) && is_ssl() ? 1 : 0,
 				'host'    => $host,
 				'uri'     => $uri,
@@ -2061,7 +2085,7 @@ try{
 
 		$raw = wp_json_encode(
 			[
-				'v'       => 6,
+				'v'       => 7,
 				'blog_id' => function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0,
 				'post_id' => $post_id,
 				'locale'  => function_exists( 'determine_locale' ) ? (string) determine_locale() : '',
